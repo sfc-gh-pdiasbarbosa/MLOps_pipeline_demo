@@ -1,7 +1,6 @@
 name: Deploy Investment Strategy Pipeline (Non-ML)
 
 on:
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       environment:
@@ -14,22 +13,6 @@ on:
           - SIT
           - UAT
           - PRD
-  push:
-    branches:
-      - 'feature/**'
-      - 'development'
-      - 'release/**'
-      - 'main'
-    paths:
-      - 'examples/quant-investment-strategy/**'
-      - 'shared/**'
-      - '.github/workflows/quant_strategy_deploy.yml'
-  pull_request:
-    branches:
-      - 'development'
-      - 'main'
-    paths:
-      - 'examples/quant-investment-strategy/**'
 
 jobs:
   deploy_strategy_pipeline:
