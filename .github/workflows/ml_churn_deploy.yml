@@ -1,0 +1,256 @@
+name: Deploy ML Churn Prediction Pipeline
+
+on:
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (DEV, SIT, UAT, PRD)'
+        required: true
+        default: 'DEV'
+        type: choice
+        options:
+          - DEV
+          - SIT
+          - UAT
+          - PRD
+  push:
+    branches:
+      - 'feature/**'
+      - 'development'
+      - 'release/**'
+      - 'main'
+    paths:
+      - 'examples/ml-churn-prediction/**'
+      - 'shared/**'
+      - '.github/workflows/ml_churn_deploy.yml'
+  pull_request:
+    branches:
+      - 'development'
+      - 'main'
+    paths:
+      - 'examples/ml-churn-prediction/**'
+
+jobs:
+  deploy_ml_pipeline:
+    runs-on: ubuntu-latest
+    environment: 
+      name: ${{ (github.ref == 'refs/heads/main' && 'production') || 'non-production' }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install snowflake-cli
+
+      - name: Determine Environment
+        id: env_selector
+        run: |
+          # Check if this is a manual workflow_dispatch with environment input
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV_INPUT="${{ github.event.inputs.environment }}"
+            echo "📋 Manual dispatch: targeting $ENV_INPUT environment"
+          else
+            # Determine environment from branch name
+            if [[ $GITHUB_REF_NAME == feature/* ]]; then
+              ENV_INPUT="DEV"
+            elif [[ $GITHUB_REF_NAME == 'development' ]]; then
+              ENV_INPUT="SIT"
+            elif [[ $GITHUB_REF_NAME == release/* ]]; then
+              ENV_INPUT="UAT"
+            elif [[ $GITHUB_REF_NAME == 'main' ]]; then
+              ENV_INPUT="PRD"
+            else
+              ENV_INPUT="DEV"
+            fi
+            echo "🌿 Branch-based: $GITHUB_REF_NAME → $ENV_INPUT environment"
+          fi
+          
+          # Set environment variables based on ENV_INPUT
+          case $ENV_INPUT in
+            DEV)
+              echo "ENV_NAME=DEV" >> $GITHUB_ENV
+              echo "SNOWFLAKE_DB=DEV_ML_DB" >> $GITHUB_ENV
+              echo "SNOWFLAKE_WH=DEV_WH_XS" >> $GITHUB_ENV
+              echo "ENV_ROLE_SECRET=SNOWFLAKE_DEV_ROLE" >> $GITHUB_ENV
+              ;;
+            SIT)
+              echo "ENV_NAME=SIT" >> $GITHUB_ENV
+              echo "SNOWFLAKE_DB=SIT_ML_DB" >> $GITHUB_ENV
+              echo "SNOWFLAKE_WH=SIT_WH_S" >> $GITHUB_ENV
+              echo "ENV_ROLE_SECRET=SNOWFLAKE_SIT_ROLE" >> $GITHUB_ENV
+              ;;
+            UAT)
+              echo "ENV_NAME=UAT" >> $GITHUB_ENV
+              echo "SNOWFLAKE_DB=UAT_ML_DB" >> $GITHUB_ENV
+              echo "SNOWFLAKE_WH=UAT_WH_M" >> $GITHUB_ENV
+              echo "ENV_ROLE_SECRET=SNOWFLAKE_UAT_ROLE" >> $GITHUB_ENV
+              ;;
+            PRD)
+              echo "ENV_NAME=PRD" >> $GITHUB_ENV
+              echo "SNOWFLAKE_DB=PRD_ML_DB" >> $GITHUB_ENV
+              echo "SNOWFLAKE_WH=PRD_WH_L" >> $GITHUB_ENV
+              echo "ENV_ROLE_SECRET=SNOWFLAKE_PRD_ROLE" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Determine Role
+        id: role_selector
+        run: |
+          # Select role based on environment
+          # Priority: environment-specific secret > fallback SNOWFLAKE_ROLE
+          ENV="${{ env.ENV_NAME }}"
+          echo "Environment: $ENV"
+          
+          case "$ENV" in
+            DEV)
+              ROLE="${{ secrets.SNOWFLAKE_DEV_ROLE }}"
+              ;;
+            SIT)
+              ROLE="${{ secrets.SNOWFLAKE_SIT_ROLE }}"
+              ;;
+            UAT)
+              ROLE="${{ secrets.SNOWFLAKE_UAT_ROLE }}"
+              ;;
+            PRD)
+              ROLE="${{ secrets.SNOWFLAKE_PRD_ROLE }}"
+              ;;
+          esac
+          
+          # Fallback to generic SNOWFLAKE_ROLE if env-specific not set
+          if [[ -z "$ROLE" ]]; then
+            ROLE="${{ secrets.SNOWFLAKE_ROLE }}"
+            echo "Using fallback SNOWFLAKE_ROLE secret"
+          else
+            echo "Using environment-specific role for $ENV"
+          fi
+          
+          if [[ -z "$ROLE" ]]; then
+            echo "❌ Error: No role configured!"
+            echo "Please configure one of these secrets in GitHub:"
+            echo "  - SNOWFLAKE_${ENV}_ROLE (for $ENV environment)"
+            echo "  - SNOWFLAKE_ROLE (as fallback for all environments)"
+            exit 1
+          fi
+          
+          echo "SNOWFLAKE_ROLE_FINAL=$ROLE" >> $GITHUB_ENV
+          echo "✅ Role configured successfully"
+
+      - name: Validate Secrets
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "Validating required secrets..."
+          
+          if [[ -z "$SNOWFLAKE_ACCOUNT" ]]; then
+            echo "❌ Error: SNOWFLAKE_ACCOUNT secret is not configured"
+            echo "Please add this secret in: Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          
+          if [[ -z "$SNOWFLAKE_USER" ]]; then
+            echo "❌ Error: SNOWFLAKE_USER secret is not configured"
+            exit 1
+          fi
+          
+          if [[ -z "$SNOWFLAKE_PRIVATE_KEY" ]]; then
+            echo "❌ Error: SNOWFLAKE_PRIVATE_KEY secret is not configured"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets are configured"
+          echo "Account: [CONFIGURED]"
+          echo "User: [CONFIGURED]"
+          echo "Private Key: [CONFIGURED]"
+          echo "Role: ${{ env.SNOWFLAKE_ROLE_FINAL }}"
+
+      - name: Configure Snow CLI Connection
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          # Write the private key file
+          echo "$SNOWFLAKE_PRIVATE_KEY" > deploy_key.p8
+          chmod 600 deploy_key.p8
+          
+          # Create Snow CLI config directory
+          mkdir -p ~/.snowflake
+          
+          # Create connections config file (TOML format)
+          cat > ~/.snowflake/connections.toml << EOF
+          [ci_connection]
+          account = "$SNOWFLAKE_ACCOUNT"
+          user = "$SNOWFLAKE_USER"
+          private_key_path = "$(pwd)/deploy_key.p8"
+          role = "${{ env.SNOWFLAKE_ROLE_FINAL }}"
+          warehouse = "${{ env.SNOWFLAKE_WH }}"
+          database = "${{ env.SNOWFLAKE_DB }}"
+          schema = "PIPELINES"
+          authenticator = "SNOWFLAKE_JWT"
+          EOF
+          
+          chmod 600 ~/.snowflake/connections.toml
+          
+          # Test the connection
+          echo "Testing connection..."
+          echo "Account format should be: orgname-accountname OR accountlocator.region"
+          echo "Account (first 5 chars): ${SNOWFLAKE_ACCOUNT:0:5}***"
+          
+          snow connection test -c ci_connection --debug 2>&1 || {
+            echo ""
+            echo "❌ Connection test failed"
+            echo ""
+            echo "Common fixes for 404 error:"
+            echo "  - Account should NOT include 'snowflakecomputing.com'"
+            echo "  - Use format: orgname-accountname OR xy12345.us-east-1"
+            echo ""
+            echo "Debug: Key format check..."
+            echo "First line: $(head -1 deploy_key.p8)"
+            echo "Last line: $(tail -1 deploy_key.p8)"
+            exit 1
+          }
+          echo "✅ Connection configured successfully"
+
+      - name: Create Stage via Snow CLI
+        run: |
+          snow sql -q "CREATE STAGE IF NOT EXISTS ML_CODE_STAGE" -c ci_connection
+
+      - name: Upload ML Code Artifacts
+        run: |
+          snow stage copy examples/ml-churn-prediction/src/ml_logic.py @ML_CODE_STAGE --overwrite -c ci_connection
+
+      - name: Deploy ML Pipeline
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          SNOWFLAKE_ROLE: ${{ env.SNOWFLAKE_ROLE_FINAL }}
+          SNOWFLAKE_WAREHOUSE: ${{ env.SNOWFLAKE_WH }}
+          SNOWFLAKE_DATABASE: ${{ env.SNOWFLAKE_DB }}
+          SNOWFLAKE_SCHEMA: "PIPELINES"
+        run: |
+          cd examples/ml-churn-prediction
+          python scripts/deploy_pipeline.py ${{ env.ENV_NAME }}
+      
+      - name: Post-Deployment Validation
+        run: |
+          echo "✅ ML Churn Prediction Pipeline deployed successfully"
+          echo "Environment: ${{ env.ENV_NAME }}"
+          echo "Database: ${{ env.SNOWFLAKE_DB }}"
+          echo "Pipeline: ML_RETRAINING_PIPELINE"
+          
+      - name: Cleanup Key
+        if: always()
+        run: rm -f deploy_key.p8
+
